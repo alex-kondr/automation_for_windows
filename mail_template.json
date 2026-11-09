@@ -1,0 +1,103 @@
+{
+  "name": "Обробка пошти та друк двох PDF",
+  "description": "Сценарій із семантичними UIA-локаторами, точками схвалення та захистом від зміщення вікна",
+  "speed_factor": 1.0,
+  "use_smart_vision": true,
+  "created_at": 1729340000.0,
+  "actions": [
+    {
+      "type": "checkpoint",
+      "delay_before": 0.5,
+      "title": "Крок 1: Вибір документу та адресата",
+      "message": "Оберіть потрібний документ та адресата у вашій програмі. Коли все готово — натисніть 'Продовжити'."
+    },
+    {
+      "type": "click",
+      "target_type": "element",
+      "element_text": "Формування листа",
+      "uia_name": "Формування листа",
+      "uia_control_type": "TabItem",
+      "delay_before": 0.8,
+      "x": 650,
+      "y": 280,
+      "button": "left",
+      "comment": "Перехід на вкладку формування листа"
+    },
+    {
+      "type": "checkpoint",
+      "delay_before": 0.8,
+      "title": "Крок 2: Перевірка адреси",
+      "message": "Уважно перевірте адресу одержувача. Якщо все вірно — натисніть 'Продовжити' для збереження запису."
+    },
+    {
+      "type": "click",
+      "target_type": "element",
+      "element_text": "Зберегти",
+      "uia_name": "Зберегти",
+      "uia_control_type": "Button",
+      "delay_before": 0.7,
+      "x": 820,
+      "y": 620,
+      "button": "left",
+      "comment": "Збереження запису та генерація 1-го PDF"
+    },
+    {
+      "type": "delay",
+      "delay_before": 1.5,
+      "comment": "Очікування готовності 1-го документа"
+    },
+    {
+      "type": "menu_click",
+      "target_type": "menu_item",
+      "element_text": "Додаткові дії",
+      "uia_name": "Додаткові дії",
+      "uia_control_type": "MenuItem",
+      "delay_before": 0.8,
+      "x": 750,
+      "y": 450,
+      "button": "left",
+      "comment": "Виклик меню 'Додаткові дії'"
+    },
+    {
+      "type": "checkpoint",
+      "delay_before": 0.5,
+      "title": "Крок 3: Принтер — 1-й документ",
+      "message": "Вставте відповідний ПЕРШИЙ бланк/лист у принтер. Коли папір на місці — натисніть 'Продовжити'."
+    },
+    {
+      "type": "click",
+      "target_type": "element",
+      "element_text": "Друк",
+      "uia_name": "Друк",
+      "uia_control_type": "Button",
+      "delay_before": 0.6,
+      "x": 900,
+      "y": 700,
+      "button": "left",
+      "comment": "Натискання кнопки 'Друк' 1-го PDF"
+    },
+    {
+      "type": "delay",
+      "delay_before": 2.0,
+      "comment": "Очікування друку 1-го PDF та готовності 2-го"
+    },
+    {
+      "type": "checkpoint",
+      "delay_before": 0.5,
+      "title": "Крок 4: Принтер — 2-й документ",
+      "message": "Вставте відповідний ДРУГИЙ бланк/лист у принтер. Коли папір на місці — натисніть 'Продовжити'."
+    },
+    {
+      "type": "click",
+      "target_type": "element",
+      "element_text": "Друк",
+      "uia_name": "Друк",
+      "uia_control_type": "Button",
+      "delay_before": 0.6,
+      "x": 900,
+      "y": 700,
+      "button": "left",
+      "comment": "Натискання кнопки 'Друк' 2-го PDF"
+    }
+  ]
+}

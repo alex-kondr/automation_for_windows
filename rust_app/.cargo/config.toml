@@ -1,0 +1,14 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+avx2,+fma,+sse4.2",
+]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+neon",
+]
+
+[build]
+# За замовчуванням компілюємо під поточну архітектуру хоста.
+# Для крос-компіляції під ARM64: cargo build --release --target aarch64-pc-windows-msvc
+

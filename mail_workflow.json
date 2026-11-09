@@ -1,0 +1,37 @@
+{
+  "name": "Обробка пошти та друк двох PDF",
+  "description": "Сценарій із семантичними UIA-локаторами, точками схвалення та захистом від зміщення вікна",
+  "speed_factor": 1.0,
+  "use_smart_vision": true,
+  "created_at": 1729340000.0,
+  "actions": [
+    {
+      "type": "key_press",
+      "delay_before": 0.35,
+      "target_type": "element",
+      "element_text": "",
+      "uia_window": "",
+      "uia_control_type": "",
+      "uia_name": "",
+      "uia_automation_id": "",
+      "uia_class_name": "",
+      "print_file_path": "",
+      "printer_name": "",
+      "print_settings": "",
+      "button": "left",
+      "click_at_cursor": false,
+      "scroll_to_bottom": false,
+      "show_file_menu": false,
+      "detected_files": [],
+      "search_priority": "area_1_first",
+      "use_vision": false,
+      "confidence": 0.75,
+      "template_bank": [],
+      "key": "ctrl+p",
+      "key_press_count": 1,
+      "title": "Підтвердження користувача",
+      "message": "Перевірте дані та натисніть 'Продовжити'",
+      "comment": "Виклик вікна друку (Ctrl+P)"
+    }
+  ]
+}
