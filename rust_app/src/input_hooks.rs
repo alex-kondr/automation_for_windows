@@ -341,6 +341,14 @@ static HOOK_EVENT_SENDER: Lazy<Mutex<Option<Sender<LowLevelInputEvent>>>> =
     Lazy::new(|| Mutex::new(None));
 static HELD_MODIFIERS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
+pub fn set_egui_context_for_hooks(_ctx: eframe::egui::Context) {}
+
+fn send_hook_event(ev: LowLevelInputEvent) {
+    if let Some(ref tx) = *HOOK_EVENT_SENDER.lock() {
+        let _ = tx.send(ev);
+    }
+}
+
 /// Нормалізує код віртуальної клавіші Win32 (`vkCode`) у стандартне представлення (`f6`, `esc`, `p`, `menu` тощо).
 pub fn normalize_vk_code(vk: u32) -> String {
     match VIRTUAL_KEY(vk as u16) {
@@ -421,9 +429,7 @@ unsafe extern "system" fn low_level_mouse_proc(
         };
 
         if let Some(ev) = ev_opt {
-            if let Some(ref tx) = *HOOK_EVENT_SENDER.lock() {
-                let _ = tx.send(ev);
-            }
+            send_hook_event(ev);
         }
     }
     CallNextHookEx(HHOOK::default(), n_code, w_param, l_param)
@@ -472,9 +478,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 LowLevelInputEvent::KeyRelease { key_code: full_key }
             };
 
-            if let Some(ref tx) = *HOOK_EVENT_SENDER.lock() {
-                let _ = tx.send(ev);
-            }
+            send_hook_event(ev);
         }
     }
     CallNextHookEx(HHOOK::default(), n_code, w_param, l_param)

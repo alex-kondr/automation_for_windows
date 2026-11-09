@@ -11,7 +11,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -19,11 +19,14 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, LoadIconW, LoadImageW, PostMessageW, PostQuitMessage,
-    RegisterClassW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, HICON,
-    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING, MSG,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-    WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    FindWindowW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadIconW,
+    LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT,
+    GWL_EXSTYLE, HICON, HWND_BOTTOM, HWND_TOP, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE,
+    LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING, MSG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND, WM_DESTROY,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_EX_APPWINDOW,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
 };
 
 const WM_TRAYICON: u32 = WM_USER + 20;
@@ -45,7 +48,11 @@ pub enum TrayEvent {
 
 struct TraySharedState {
     hwnd: isize,
+    main_hwnd: isize,
+    is_hidden_in_tray: bool,
+    saved_pos: (i32, i32),
     tx: Option<Sender<TrayEvent>>,
+    egui_ctx: Option<eframe::egui::Context>,
     start_hk: String,
     stop_hk: String,
 }
@@ -53,11 +60,47 @@ struct TraySharedState {
 static TRAY_STATE: Lazy<Mutex<TraySharedState>> = Lazy::new(|| {
     Mutex::new(TraySharedState {
         hwnd: 0,
+        main_hwnd: 0,
+        is_hidden_in_tray: false,
+        saved_pos: (120, 80),
         tx: None,
+        egui_ctx: None,
         start_hk: "F6".to_string(),
         stop_hk: "ESC".to_string(),
     })
 });
+
+pub const MAIN_WINDOW_TITLE: &str = "⚡ AutoFlow Assistant [Native Rust + windows-rs + SIMD Edition]";
+
+fn send_tray_event(ev: TrayEvent) {
+    let (tx_opt, ctx_opt) = {
+        let st = TRAY_STATE.lock();
+        (st.tx.clone(), st.egui_ctx.clone())
+    };
+    if let Some(tx) = tx_opt {
+        let _ = tx.send(ev);
+    }
+    if let Some(ctx) = ctx_opt {
+        ctx.request_repaint();
+    }
+}
+
+unsafe fn find_or_cache_main_hwnd() -> Option<HWND> {
+    {
+        let cached = TRAY_STATE.lock().main_hwnd;
+        if cached != 0 {
+            return Some(HWND(cached as *mut std::ffi::c_void));
+        }
+    }
+    let title_h = HSTRING::from(MAIN_WINDOW_TITLE);
+    if let Ok(hwnd) = FindWindowW(None, &title_h) {
+        if !hwnd.0.is_null() {
+            TRAY_STATE.lock().main_hwnd = hwnd.0 as isize;
+            return Some(hwnd);
+        }
+    }
+    None
+}
 
 fn copy_wide_truncated(dst: &mut [u16], text: &str) {
     dst.fill(0);
@@ -76,9 +119,8 @@ unsafe extern "system" fn tray_wnd_proc(
         WM_TRAYICON => {
             let event_code = (l_param.0 & 0xFFFF) as u32;
             if event_code == WM_LBUTTONUP || event_code == WM_LBUTTONDBLCLK {
-                if let Some(ref tx) = TRAY_STATE.lock().tx {
-                    let _ = tx.send(TrayEvent::RestoreWindow);
-                }
+                WindowsTrayManager::set_main_window_tray_state(false);
+                send_tray_event(TrayEvent::RestoreWindow);
             } else if event_code == WM_RBUTTONUP {
                 show_tray_popup_menu(hwnd);
             }
@@ -87,17 +129,21 @@ unsafe extern "system" fn tray_wnd_proc(
         WM_COMMAND => {
             let cmd_id = w_param.0 & 0xFFFF;
             let ev = match cmd_id {
-                CMD_RESTORE => Some(TrayEvent::RestoreWindow),
+                CMD_RESTORE => {
+                    WindowsTrayManager::set_main_window_tray_state(false);
+                    Some(TrayEvent::RestoreWindow)
+                }
                 CMD_START => Some(TrayEvent::StartPlayback),
                 CMD_STOP => Some(TrayEvent::StopPlayback),
-                CMD_HOTKEYS => Some(TrayEvent::OpenHotkeys),
+                CMD_HOTKEYS => {
+                    WindowsTrayManager::set_main_window_tray_state(false);
+                    Some(TrayEvent::OpenHotkeys)
+                }
                 CMD_EXIT => Some(TrayEvent::ExitApp),
                 _ => None,
             };
             if let Some(e) = ev {
-                if let Some(ref tx) = TRAY_STATE.lock().tx {
-                    let _ = tx.send(e);
-                }
+                send_tray_event(e);
             }
             LRESULT(0)
         }
@@ -278,6 +324,81 @@ impl WindowsTrayManager {
             copy_wide_truncated(&mut nid.szInfoTitle, title);
             copy_wide_truncated(&mut nid.szInfo, message);
             let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    pub fn set_egui_context(ctx: eframe::egui::Context) {
+        TRAY_STATE.lock().egui_ctx = Some(ctx);
+    }
+
+    /// Перемикає стан головного вікна між системним треєм та робочим столом (гаряча клавіша F12).
+    /// Повертає `true`, якщо вікно тепер приховане у треї, або `false`, якщо розгорнуте.
+    pub fn toggle_main_window_tray() -> bool {
+        let currently_hidden = TRAY_STATE.lock().is_hidden_in_tray;
+        Self::set_main_window_tray_state(!currently_hidden);
+        !currently_hidden
+    }
+
+    /// Приховує головне вікно у системний трей Windows (без іконки на панелі завдань і без паузи циклу `winit`)
+    /// або розгортає його назад на робочий стіл поверх активних вікон.
+    pub fn set_main_window_tray_state(hide_to_tray: bool) {
+        unsafe {
+            let Some(hwnd) = find_or_cache_main_hwnd() else {
+                return;
+            };
+
+            let start_hk = {
+                let mut st = TRAY_STATE.lock();
+                if hide_to_tray {
+                    let mut rc = RECT::default();
+                    if GetWindowRect(hwnd, &mut rc).is_ok() && rc.left > -10000 && rc.top > -10000
+                    {
+                        st.saved_pos = (rc.left, rc.top);
+                    }
+                }
+                st.is_hidden_in_tray = hide_to_tray;
+                st.start_hk.clone()
+            };
+
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            if hide_to_tray {
+                // Прибираємо з панелі завдань (Taskbar) та Alt+Tab через WS_EX_TOOLWINDOW і ховаємо за межі екрана,
+                // щоб цикл eframe::App::update продовжував миттєво обробляти гарячі клавіші F6/F7/F12!
+                let new_ex = (ex_style | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_BOTTOM,
+                    -32000,
+                    -32000,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+                Self::show_balloon(
+                    "AutoFlow у фоновому режимі (Трей)",
+                    &format!(
+                        "Програму згорнуто в системний трей. Натисніть [F12] для повернення або [{}] для запуску сценарію.",
+                        start_hk
+                    ),
+                );
+            } else {
+                let (saved_x, saved_y) = TRAY_STATE.lock().saved_pos;
+                let new_ex = (ex_style & !WS_EX_TOOLWINDOW.0) | WS_EX_APPWINDOW.0;
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOP,
+                    saved_x.max(20),
+                    saved_y.max(20),
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+                );
+                let _ = SetForegroundWindow(hwnd);
+            }
         }
     }
 

@@ -1,0 +1,1 @@
+{"rustc":222933465615791797,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[966925859616469517,"build_script_build",false,5801686205795158740]],"local":[{"RerunIfChanged":{"output":"aarch64-pc-windows-msvc\\debug\\build\\ahash-67f4194c8a622c4d\\output","paths":["build.rs"]}}],"rustflags":["-C","target-feature=+neon"],"config":0,"compile_kind":0}

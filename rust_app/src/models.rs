@@ -273,6 +273,44 @@ impl WorkflowAction {
         }
         self.uia_name.as_deref().unwrap_or("").trim().to_string()
     }
+
+    /// Повертає компактний підпис дії для списку «Повернутись до» у плаваючому вікні.
+    pub fn short_menu_label(&self, step_num: usize) -> String {
+        let detail = if self.action_type == "checkpoint" {
+            let t = self.title.as_deref().unwrap_or("Точка перевірки");
+            format!("🛑 {}", t)
+        } else if self.action_type == "scroll_to_bottom" || self.scroll_to_bottom {
+            "📜 Прокрутка до низу".to_string()
+        } else if self.action_type == "file_selection" || self.show_file_menu {
+            "📁 Вибір файлу зі списку".to_string()
+        } else if self.action_type == "area_click" || self.target_type == "area" {
+            format!(
+                "🔲 Область ({}, {})",
+                self.x.unwrap_or(0),
+                self.y.unwrap_or(0)
+            )
+        } else if self.action_type.contains("key") {
+            let k = get_key_display_name(self.key.as_deref());
+            if self.key_press_count > 1 {
+                format!("{} (×{})", k, self.key_press_count)
+            } else {
+                k
+            }
+        } else if self.click_at_cursor || self.action_type == "right_click" {
+            "🖱️ Меню ПКМ на місці".to_string()
+        } else {
+            let lbl = self.elem_text_or_uia();
+            let cmt = self.comment.as_deref().unwrap_or("").trim();
+            if !lbl.is_empty() {
+                format!("🔘 Клік \"{}\"", lbl)
+            } else if !cmt.is_empty() {
+                format!("🔘 {}", cmt)
+            } else {
+                format!("🔘 Клік ({}, {})", self.x.unwrap_or(0), self.y.unwrap_or(0))
+            }
+        };
+        format!("№{}: {}", step_num, detail)
+    }
 }
 
 fn current_unix_ts() -> f64 {
@@ -374,6 +412,7 @@ pub const HOTKEY_DEFINITIONS: &[(&str, &str, &str)] = &[
     ("checkpoint", "⏸ Точка перевірки (додати при записі / продовжити при виконанні)", "f8"),
     ("pause_recording", "⏯ Пауза / Продовжити запис дій", "f9"),
     ("stop_recording", "⏹ Завершити запис дій", "f10"),
+    ("repeat_last_action", "🔁 Повторити останню виконану дію", "f11"),
     ("toggle_tray", "📥 Згорнути в трей / Розгорнути вікно", "f12"),
 ];
 
@@ -432,4 +471,126 @@ impl HotkeysConfig {
             .insert(action_id.to_string(), key_code.trim().to_lowercase());
     }
 }
+
+/// Внутрішня пам'ять (бібліотека) сценаріїв програми, щоб зберігати та перемикати сценарії без завантаження окремих JSON-файлів.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowMemoryStore {
+    #[serde(default)]
+    pub active_index: usize,
+    #[serde(default = "default_transparency_pct")]
+    pub overlay_transparency_pct: u8,
+    #[serde(default)]
+    pub presets: Vec<Workflow>,
+}
+
+fn default_transparency_pct() -> u8 {
+    25
+}
+
+impl WorkflowMemoryStore {
+    pub fn memory_file_path(base_dir: &Path) -> std::path::PathBuf {
+        base_dir.join("workflows_memory.json")
+    }
+
+    pub fn load_or_init(base_dir: &Path) -> Self {
+        let mem_path = Self::memory_file_path(base_dir);
+        if let Ok(raw) = fs::read_to_string(&mem_path) {
+            if let Ok(mut store) = serde_json::from_str::<WorkflowMemoryStore>(&raw) {
+                store.overlay_transparency_pct = store.overlay_transparency_pct.clamp(5, 85);
+                for wf in &mut store.presets {
+                    for act in &mut wf.actions {
+                        if let Some(ref k) = act.key {
+                            act.key = Some(normalize_stored_key_code(Some(k)));
+                        }
+                    }
+                }
+                if !store.presets.is_empty() {
+                    store.active_index = store.active_index.min(store.presets.len() - 1);
+                    return store;
+                }
+            }
+        }
+
+        // Якщо файл пам'яті ще не існує — автоматично імпортуємо наявні сценарії у внутрішню пам'ять програми
+        let mut presets = Vec::new();
+        let initial_files = [
+            ("last_session_workflow.json", "Робочий сценарій (Поточний)"),
+            ("mail_workflow.json", "Обробка пошти (Основний)"),
+            ("mail_template.json", "Зразок: Пошта + 2 PDF"),
+            ("1.json", "Сценарій №1"),
+        ];
+
+        for &(fname, fallback_title) in &initial_files {
+            let p = base_dir.join(fname);
+            if p.exists() {
+                if let Ok(mut wf) = Workflow::load_from_file(&p) {
+                    if wf.name.trim().is_empty()
+                        || presets.iter().any(| existing: &Workflow | existing.name == wf.name)
+                    {
+                        wf.name = fallback_title.to_string();
+                    }
+                    presets.push(wf);
+                }
+            }
+        }
+
+        if presets.is_empty() {
+            presets.push(Workflow::default());
+        }
+
+        let store = Self {
+            active_index: 0,
+            overlay_transparency_pct: 25,
+            presets,
+        };
+        store.save(base_dir);
+        store
+    }
+
+    pub fn save(&self, base_dir: &Path) {
+        let mem_path = Self::memory_file_path(base_dir);
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = fs::write(mem_path, json);
+        }
+    }
+
+    pub fn sync_active(&mut self, wf: &Workflow, base_dir: &Path) {
+        if self.presets.is_empty() {
+            self.presets.push(wf.clone());
+            self.active_index = 0;
+        } else {
+            let idx = self.active_index.min(self.presets.len() - 1);
+            self.presets[idx] = wf.clone();
+        }
+        self.save(base_dir);
+    }
+
+    pub fn save_as_new(&mut self, mut wf: Workflow, new_name: &str, base_dir: &Path) {
+        let clean = new_name.trim();
+        wf.name = if clean.is_empty() {
+            format!("Сценарій #{}", self.presets.len() + 1)
+        } else {
+            clean.to_string()
+        };
+        self.presets.push(wf);
+        self.active_index = self.presets.len() - 1;
+        self.save(base_dir);
+    }
+
+    pub fn delete_active(&mut self, base_dir: &Path) -> Workflow {
+        if self.presets.len() > 1 {
+            let idx = self.active_index.min(self.presets.len() - 1);
+            self.presets.remove(idx);
+            self.active_index = idx.min(self.presets.len() - 1);
+        } else if let Some(first) = self.presets.first_mut() {
+            first.actions.clear();
+        }
+        self.save(base_dir);
+        self.presets
+            .get(self.active_index)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
 

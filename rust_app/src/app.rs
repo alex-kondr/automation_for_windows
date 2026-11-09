@@ -3,11 +3,12 @@
 //! лічильники натискань клавіш, плаваючу панель запису, конструктор дій, точки перевірки та гарячі клавіші.
 
 use crate::input_hooks::{
-    get_cursor_pos, play_beep, start_global_input_hooks, LowLevelInputEvent,
+    get_cursor_pos, play_beep, set_egui_context_for_hooks, start_global_input_hooks,
+    LowLevelInputEvent,
 };
 use crate::models::{
     get_key_display_name, DetectedFile, HotkeysConfig, Workflow, WorkflowAction,
-    HOTKEY_DEFINITIONS,
+    WorkflowMemoryStore, HOTKEY_DEFINITIONS,
 };
 use crate::ocr_and_gemini::{
     extract_element_text_from_crop, get_gemini_api_key, is_gemini_available, set_gemini_api_key,
@@ -15,6 +16,7 @@ use crate::ocr_and_gemini::{
 use crate::player::{ActionPlayer, PlayerUiEvent};
 use crate::recorder::ActionRecorder;
 use crate::simd_vision::VisionMatcher;
+use crate::status_overlay::{OverlayClickEvent, OverlayData, OverlayKind, TopmostStatusOverlay};
 use crate::tray::{TrayEvent, WindowsTrayManager};
 use crate::uia_manager::UIAManager;
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
@@ -66,6 +68,10 @@ pub enum ActiveModal {
         show_file_menu: bool,
         picking_point: bool,
     },
+    SaveMemoryPresetDialog {
+        name_input: String,
+        create_empty: bool,
+    },
 }
 
 pub struct CheckpointState {
@@ -85,6 +91,7 @@ pub struct FileMenuState {
 pub struct AutoFlowApp {
     pub base_dir: PathBuf,
     pub workflow: Workflow,
+    pub memory_store: WorkflowMemoryStore,
     pub current_workflow_path: Option<PathBuf>,
     pub training_runs: usize,
 
@@ -114,11 +121,13 @@ pub struct AutoFlowApp {
 
     pub is_minimized_to_tray: bool,
     pub compact_floating_mode: bool,
+    pub show_topmost_hud: bool,
 
     hook_rx: Receiver<LowLevelInputEvent>,
     player_tx: Sender<PlayerUiEvent>,
     player_rx: Receiver<PlayerUiEvent>,
     tray_rx: Receiver<TrayEvent>,
+    overlay_rx: Receiver<OverlayClickEvent>,
 }
 
 const ACTION_TYPE_LABELS: &[&str] = &[
@@ -149,10 +158,13 @@ impl AutoFlowApp {
         let hk_config = HotkeysConfig::load_or_default(&hk_path.to_string_lossy());
 
         let (hook_tx, hook_rx) = mpsc::channel();
+        set_egui_context_for_hooks(cc.egui_ctx.clone());
         start_global_input_hooks(hook_tx);
 
         let (player_tx, player_rx) = mpsc::channel();
         let (tray_tx, tray_rx) = mpsc::channel();
+        let (overlay_tx, overlay_rx) = mpsc::channel();
+        TopmostStatusOverlay::start(overlay_tx, cc.egui_ctx.clone());
 
         let ico_path = if base_dir.join("rust_app/assets/autoflow.ico").exists() {
             base_dir.join("rust_app/assets/autoflow.ico")
@@ -162,11 +174,20 @@ impl AutoFlowApp {
         let start_hk = hk_config.get("start_playback").to_uppercase();
         let stop_hk = hk_config.get("stop_playback").to_uppercase();
         let tip = format!("AutoFlow Assistant (Старт: {} | Стоп: {})", start_hk, stop_hk);
+        WindowsTrayManager::set_egui_context(cc.egui_ctx.clone());
         WindowsTrayManager::start(ico_path, &tip, &start_hk, &stop_hk, tray_tx);
+
+        let memory_store = WorkflowMemoryStore::load_or_init(&base_dir);
+        let initial_wf = memory_store
+            .presets
+            .get(memory_store.active_index)
+            .cloned()
+            .unwrap_or_default();
 
         let mut app = Self {
             base_dir,
-            workflow: Workflow::default(),
+            workflow: initial_wf,
+            memory_store,
             current_workflow_path: None,
             training_runs: 0,
             recorder: ActionRecorder::new(true),
@@ -183,21 +204,22 @@ impl AutoFlowApp {
             running_row: None,
             status_badge_text: "🟢 Готовий".to_string(),
             status_badge_color: Color32::from_rgb(30, 58, 138),
-            progress_text: "Готовий. Всі дії доступні у верхньому меню. Натисніть '▶ Старт' або гарячу клавішу для швидкого запуску.".to_string(),
+            progress_text: "Готовий. Сценарії зберігаються у внутрішній пам'яті програми. Натисніть '▶ Старт' для запуску.".to_string(),
             progress_fraction: 0.0,
             active_modal: ActiveModal::None,
             active_checkpoint: None,
             active_file_menu: None,
             is_minimized_to_tray: false,
             compact_floating_mode: false,
+            show_topmost_hud: false,
             hook_rx,
             player_tx,
             player_rx,
             tray_rx,
+            overlay_rx,
         };
 
         app.load_env_gemini_key();
-        app.load_default_workflow_if_exists();
         app
     }
 
@@ -244,44 +266,11 @@ impl AutoFlowApp {
         };
     }
 
-    fn load_default_workflow_if_exists(&mut self) {
-        let state_file = self.base_dir.join("app_state.json");
-        if let Ok(raw) = fs::read_to_string(&state_file) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(last_p) = val["last_workflow_path"].as_str() {
-                    let p = PathBuf::from(last_p);
-                    if p.exists() {
-                        if let Ok(wf) = Workflow::load_from_file(&p) {
-                            self.workflow = wf;
-                            self.current_workflow_path = Some(p);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        let candidates = [
-            "last_session_workflow.json",
-            "mail_workflow.json",
-            "mail_template.json",
-            "1.json",
-        ];
-        for c in &candidates {
-            let p = self.base_dir.join(c);
-            if p.exists() {
-                if let Ok(wf) = Workflow::load_from_file(&p) {
-                    self.workflow = wf;
-                    self.current_workflow_path = Some(p);
-                    return;
-                }
-            }
-        }
-    }
-
-    pub fn autosave_workflow(&self) {
+    pub fn autosave_workflow(&mut self) {
         let session_path = self.base_dir.join("last_session_workflow.json");
         let _ = self.workflow.save_to_file(&session_path);
+        self.memory_store
+            .sync_active(&self.workflow, &self.base_dir);
         if let Some(ref cur_p) = self.current_workflow_path {
             let _ = self.workflow.save_to_file(cur_p);
             let state_json = serde_json::json!({
@@ -301,14 +290,24 @@ impl AutoFlowApp {
             .pick_file()
         {
             match Workflow::load_from_file(&path) {
-                Ok(wf) => {
-                    self.workflow = wf;
+                Ok(mut wf) => {
+                    let fname = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if wf.name.trim().is_empty() {
+                        wf.name = fname.clone();
+                    }
+                    self.workflow = wf.clone();
                     self.current_workflow_path = Some(path.clone());
                     self.selected_row = None;
+                    self.memory_store
+                        .save_as_new(wf, &self.workflow.name, &self.base_dir);
                     self.autosave_workflow();
                     self.progress_text = format!(
-                        "📂 Завантажено сценарій '{}' ({} дій)",
-                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        "📂 Імпортовано у пам'ять сценарій '{}' ({} дій)",
+                        self.workflow.name,
                         self.workflow.actions.len()
                     );
                 }
@@ -421,23 +420,19 @@ impl AutoFlowApp {
         self.switch_to_floating_recording_bar(ctx);
     }
 
-    fn switch_to_floating_recording_bar(&mut self, ctx: &egui::Context) {
-        self.compact_floating_mode = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(620.0, 56.0)));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(240.0, 18.0)));
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-            egui::WindowLevel::AlwaysOnTop,
-        ));
+    fn switch_to_floating_recording_bar(&mut self, _ctx: &egui::Context) {
+        self.compact_floating_mode = false;
+        self.is_minimized_to_tray = true;
+        WindowsTrayManager::set_main_window_tray_state(true);
+        self.sync_topmost_overlay();
     }
 
-    fn restore_main_window_geometry(&mut self, ctx: &egui::Context) {
+    fn restore_main_window_geometry(&mut self, _ctx: &egui::Context) {
         self.compact_floating_mode = false;
         self.recorder.ignored_rect = None;
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-            egui::WindowLevel::Normal,
-        ));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(1040.0, 700.0)));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(120.0, 80.0)));
+        self.is_minimized_to_tray = false;
+        WindowsTrayManager::set_main_window_tray_state(false);
+        self.sync_topmost_overlay();
     }
 
     pub fn finish_recording(&mut self, ctx: &egui::Context) {
@@ -527,6 +522,34 @@ impl AutoFlowApp {
     pub fn test_single_selected_action(&mut self) {
         if let Some(sel) = self.selected_row {
             self.start_playback_range(sel, Some(sel + 1), Some(1));
+        }
+    }
+
+    /// Повторює останню виконану дію (або поточний/обраний крок), як під час активного виконання, так і в режимі очікування.
+    pub fn repeat_last_action(&mut self) {
+        if self.workflow.actions.is_empty() || self.recorder.is_recording {
+            return;
+        }
+        let target_idx = self
+            .player
+            .last_executed_step()
+            .or_else(|| {
+                self.active_checkpoint
+                    .as_ref()
+                    .map(|cp| cp.step_idx.saturating_sub(1))
+            })
+            .or(self.running_row)
+            .or(self.selected_row)
+            .unwrap_or(0)
+            .min(self.workflow.actions.len() - 1);
+
+        if self.player.is_running.load(Ordering::SeqCst) {
+            self.active_checkpoint = None;
+            self.player.jump_to_step(target_idx);
+            self.progress_text = format!("🔁 Повтор дії №{}...", target_idx + 1);
+        } else {
+            self.selected_row = Some(target_idx);
+            self.start_playback_range(target_idx, Some(target_idx + 1), Some(1));
         }
     }
 
@@ -754,6 +777,10 @@ impl AutoFlowApp {
                     });
                 }
                 PlayerUiEvent::FileMenuRequest { files, action } => {
+                    if self.is_minimized_to_tray {
+                        self.is_minimized_to_tray = false;
+                        WindowsTrayManager::set_main_window_tray_state(false);
+                    }
                     self.active_file_menu = Some(FileMenuState { files, action });
                 }
                 PlayerUiEvent::Finished { success, message } => {
@@ -773,8 +800,7 @@ impl AutoFlowApp {
             match tev {
                 TrayEvent::RestoreWindow => {
                     self.is_minimized_to_tray = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    WindowsTrayManager::set_main_window_tray_state(false);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 TrayEvent::StartPlayback => {
@@ -785,8 +811,7 @@ impl AutoFlowApp {
                 }
                 TrayEvent::OpenHotkeys => {
                     self.is_minimized_to_tray = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    WindowsTrayManager::set_main_window_tray_state(false);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     let draft: Vec<(String, String, String)> = HOTKEY_DEFINITIONS
                         .iter()
@@ -805,6 +830,204 @@ impl AutoFlowApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
+        }
+
+        // 4. Події кліків по нативному напівпрозорому вікну поверх усіх вікон (TopmostStatusOverlay)
+        while let Ok(oev) = self.overlay_rx.try_recv() {
+            match oev {
+                OverlayClickEvent::ToggleTargetMode => {
+                    self.recorder.current_target_type =
+                        if self.recorder.current_target_type == "area" {
+                            "element".to_string()
+                        } else {
+                            "area".to_string()
+                        };
+                }
+                OverlayClickEvent::AddScroll => {
+                    let _ = self.recorder.add_scroll_to_bottom();
+                }
+                OverlayClickEvent::AddFileSelection => {
+                    let _ = self.recorder.add_file_selection(true);
+                }
+                OverlayClickEvent::AddCheckpoint => {
+                    let _ = self.recorder.add_checkpoint(
+                        "Точка перевірки",
+                        "Перевірте дані та натисніть 'Продовжити'",
+                    );
+                }
+                OverlayClickEvent::TogglePauseRecording => {
+                    let paused = self.recorder.toggle_pause();
+                    self.status_badge_text = if paused {
+                        "⏸ ПАУЗА".to_string()
+                    } else {
+                        "🔴 ЗАПИС".to_string()
+                    };
+                }
+                OverlayClickEvent::StopRecording => {
+                    self.finish_recording(ctx);
+                }
+                OverlayClickEvent::CheckpointContinue => {
+                    self.active_checkpoint = None;
+                    self.player.resume_from_checkpoint("continue");
+                }
+                OverlayClickEvent::CheckpointSkip => {
+                    self.active_checkpoint = None;
+                    self.player.resume_from_checkpoint("skip");
+                }
+                OverlayClickEvent::StopPlayback => {
+                    if self.active_checkpoint.is_some() {
+                        self.active_checkpoint = None;
+                        self.player.resume_from_checkpoint("abort");
+                    } else {
+                        self.stop_playback();
+                    }
+                }
+                OverlayClickEvent::JumpToStep(target_idx) => {
+                    self.active_checkpoint = None;
+                    self.player.jump_to_step(target_idx);
+                    self.running_row = Some(target_idx);
+                    self.progress_text =
+                        format!("⏪ Повернення до кроку №{}...", target_idx + 1);
+                }
+                OverlayClickEvent::BoundsChanged(x1, y1, x2, y2) => {
+                    self.recorder
+                        .set_ignored_region(x1 - 4, y1 - 4, x2 + 4, y2 + 4);
+                }
+            }
+        }
+
+        self.sync_topmost_overlay();
+    }
+
+    /// Синхронізує нативне напівпрозоре вікно стану (`WS_EX_TOPMOST | WS_EX_LAYERED`) поверх усіх вікон Windows.
+    /// Вікно відображається ТІЛЬКИ під час активного виконання автоматизації або запису.
+    pub fn sync_topmost_overlay(&self) {
+        if !self.show_topmost_hud {
+            TopmostStatusOverlay::hide();
+            return;
+        }
+
+        let hk_stop = self.hk_config.get("stop_playback").to_uppercase();
+        let hk_cp = self.hk_config.get("checkpoint").to_uppercase();
+        let hk_pause = self.hk_config.get("pause_recording").to_uppercase();
+        let hk_stop_rec = self.hk_config.get("stop_recording").to_uppercase();
+        let hk_tray = self.hk_config.get("toggle_tray").to_uppercase();
+        let hk_repeat = self.hk_config.get("repeat_last_action").to_uppercase();
+        let transparency_pct = self.memory_store.overlay_transparency_pct;
+
+        // Формуємо список попередніх/доступних кроків для кнопки «⏪ Повернутись ▾»
+        let build_step_history = |up_to_idx: usize| -> Vec<(usize, String)> {
+            if self.workflow.actions.is_empty() {
+                return Vec::new();
+            }
+            let max_i = up_to_idx.min(self.workflow.actions.len().saturating_sub(1));
+            (0..=max_i)
+                .map(|i| (i, self.workflow.actions[i].short_menu_label(i + 1)))
+                .collect()
+        };
+
+        if self.recorder.is_recording {
+            let (mode_lbl, border_rgb, header_rgb) = if self.recorder.is_paused {
+                ("⏸ ПАУЗА ЗАПИСУ", (245, 158, 11), (251, 191, 36))
+            } else {
+                match self.recording_mode {
+                    RecordingModeKind::FullNew => {
+                        ("🔴 ЗАПИС СЦЕНАРІЮ", (239, 68, 68), (248, 113, 113))
+                    }
+                    RecordingModeKind::Append { .. } => {
+                        ("🟠 ДОЗАПИС ДІЙ", (217, 119, 6), (251, 191, 36))
+                    }
+                    RecordingModeKind::RetrainChunk { .. } => {
+                        ("🟣 ДОНАВЧАННЯ ШМАТКА", (124, 58, 237), (192, 132, 252))
+                    }
+                }
+            };
+            TopmostStatusOverlay::update_state(OverlayData {
+                kind: OverlayKind::Recording,
+                header_text: format!(
+                    "{}  •  Записано дій: {}",
+                    mode_lbl,
+                    self.recorder.actions.len()
+                ),
+                detail_text: "Клікайте мишею або натискайте клавіші".to_string(),
+                hotkey_hint: format!(
+                    "[{}] Точка | [{}] Пауза | [{}] Стоп",
+                    hk_cp, hk_pause, hk_stop_rec
+                ),
+                border_rgb,
+                header_rgb,
+                is_paused: self.recorder.is_paused,
+                target_mode_area: self.recorder.current_target_type == "area",
+                transparency_pct,
+                hk_cp,
+                hk_pause,
+                hk_stop_rec,
+                hk_stop_play: hk_stop,
+                hk_repeat,
+                step_history: Vec::new(),
+            });
+        } else if let Some(ref cp) = self.active_checkpoint {
+            let title = cp.action.title.as_deref().unwrap_or("Точка перевірки");
+            let msg = cp
+                .action
+                .message
+                .as_deref()
+                .unwrap_or("Перевірте дані на екрані та підтвердіть продовження.")
+                .replace('\n', " ");
+            TopmostStatusOverlay::update_state(OverlayData {
+                kind: OverlayKind::Checkpoint,
+                header_text: format!(
+                    "⏸️ {}  •  Лист {}/{} • Крок {}/{}",
+                    title,
+                    cp.cycle,
+                    cp.total_cycles,
+                    cp.step_idx + 1,
+                    cp.total_steps
+                ),
+                detail_text: msg,
+                hotkey_hint: format!(
+                    "[{}] Далі | [{}] Повтор | [{}] Стоп",
+                    hk_cp, hk_repeat, hk_stop
+                ),
+                border_rgb: (245, 158, 11),
+                header_rgb: (251, 191, 36),
+                is_paused: false,
+                target_mode_area: false,
+                transparency_pct,
+                hk_cp,
+                hk_pause,
+                hk_stop_rec,
+                hk_stop_play: hk_stop,
+                hk_repeat,
+                step_history: build_step_history(cp.step_idx),
+            });
+        } else if self.player.is_running.load(Ordering::SeqCst) {
+            let cur_idx = self.running_row.unwrap_or(0);
+            let step_num = cur_idx + 1;
+            let total = self.workflow.actions.len().max(1);
+            TopmostStatusOverlay::update_state(OverlayData {
+                kind: OverlayKind::Playing,
+                header_text: format!("▶️ ВИКОНАННЯ  •  Крок {}/{}", step_num, total),
+                detail_text: self.progress_text.clone(),
+                hotkey_hint: format!(
+                    "[{}] Стоп | [{}] Повтор | [{}] Трей",
+                    hk_stop, hk_repeat, hk_tray
+                ),
+                border_rgb: (16, 185, 129),
+                header_rgb: (52, 211, 153),
+                is_paused: false,
+                target_mode_area: false,
+                transparency_pct,
+                hk_cp,
+                hk_pause,
+                hk_stop_rec,
+                hk_stop_play: hk_stop,
+                hk_repeat,
+                step_history: build_step_history(cur_idx),
+            });
+        } else {
+            // Коли виконання дій зупинено — ховаємо вікно поверх усіх вікон
+            TopmostStatusOverlay::hide();
         }
     }
 
@@ -957,6 +1180,7 @@ impl AutoFlowApp {
         let hk_pause = self.hk_config.get("pause_recording");
         let hk_rec_stop = self.hk_config.get("stop_recording");
         let hk_tray = self.hk_config.get("toggle_tray");
+        let hk_repeat = self.hk_config.get("repeat_last_action");
 
         // Якщо активний запис — передаємо події в ActionRecorder
         if self.recorder.is_recording {
@@ -1008,6 +1232,9 @@ impl AutoFlowApp {
                     self.active_checkpoint = None;
                     self.player.resume_from_checkpoint("abort");
                     return;
+                } else if *key_code == hk_repeat {
+                    self.repeat_last_action();
+                    return;
                 }
             }
         }
@@ -1020,9 +1247,10 @@ impl AutoFlowApp {
                 self.start_playback();
             } else if key_code == hk_rec && !self.player.is_running.load(Ordering::SeqCst) {
                 self.start_recording_full(ctx);
+            } else if key_code == hk_repeat {
+                self.repeat_last_action();
             } else if key_code == hk_tray {
-                self.is_minimized_to_tray = !self.is_minimized_to_tray;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(self.is_minimized_to_tray));
+                self.is_minimized_to_tray = WindowsTrayManager::toggle_main_window_tray();
             }
         }
     }
@@ -1162,6 +1390,7 @@ impl AutoFlowApp {
         let hk_rec = self.hk_config.get("start_recording").to_uppercase();
         let hk_cp = self.hk_config.get("checkpoint").to_uppercase();
         let hk_tray = self.hk_config.get("toggle_tray").to_uppercase();
+        let hk_repeat = self.hk_config.get("repeat_last_action").to_uppercase();
 
         egui::TopBottomPanel::top("top_menubar")
             .frame(
@@ -1174,14 +1403,38 @@ impl AutoFlowApp {
                     // 1. Меню "Файл"
                     ui.menu_button("📁 Файл ▾", |ui| {
                         if ui
-                            .button("📂 Відкрити сценарій... (Ctrl+O)")
+                            .button("➕ Новий сценарій у пам'яті програми...")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.active_modal = ActiveModal::SaveMemoryPresetDialog {
+                                name_input: format!(
+                                    "Сценарій {}",
+                                    self.memory_store.presets.len() + 1
+                                ),
+                                create_empty: true,
+                            };
+                        }
+                        if ui
+                            .button("💾 Зберегти копію в пам'ять програми...")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.active_modal = ActiveModal::SaveMemoryPresetDialog {
+                                name_input: format!("{} (копія)", self.workflow.name),
+                                create_empty: false,
+                            };
+                        }
+                        ui.separator();
+                        if ui
+                            .button("📂 Імпортувати сценарій з JSON... (Ctrl+O)")
                             .clicked()
                         {
                             ui.close_menu();
                             self.load_workflow_dialog();
                         }
                         if ui
-                            .button("💾 Зберегти сценарій... (Ctrl+S)")
+                            .button("💾 Експортувати сценарій у JSON... (Ctrl+S)")
                             .clicked()
                         {
                             ui.close_menu();
@@ -1202,14 +1455,7 @@ impl AutoFlowApp {
                         {
                             ui.close_menu();
                             self.is_minimized_to_tray = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                            WindowsTrayManager::show_balloon(
-                                "AutoFlow у фоновому режимі",
-                                &format!(
-                                    "Програму згорнуто в трей. Натисніть [{}] для швидкого Старту або клікніть по іконці біля годинника.",
-                                    hk_start
-                                ),
-                            );
+                            WindowsTrayManager::set_main_window_tray_state(true);
                         }
                         ui.separator();
                         if ui.button("🚪 Вихід").clicked() {
@@ -1272,6 +1518,16 @@ impl AutoFlowApp {
                         {
                             ui.close_menu();
                             self.test_single_selected_action();
+                        }
+                        if ui
+                            .button(format!(
+                                "🔁 Повторити останню дію ({})",
+                                hk_repeat
+                            ))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.repeat_last_action();
                         }
                         ui.separator();
                         if ui
@@ -1429,6 +1685,35 @@ impl AutoFlowApp {
                             };
                         }
                         ui.separator();
+                        if ui
+                            .button(format!("📥 Згорнути у системний трей ({})", hk_tray))
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.is_minimized_to_tray = true;
+                            WindowsTrayManager::set_main_window_tray_state(true);
+                        }
+                        ui.separator();
+                        ui.checkbox(
+                            &mut self.show_topmost_hud,
+                            "📌 Вікно стану поверх усіх вікон (під час роботи)",
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Прозорість %:");
+                            if ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.memory_store.overlay_transparency_pct,
+                                        5..=85,
+                                    )
+                                    .suffix("%"),
+                                )
+                                .changed()
+                            {
+                                self.memory_store.save(&self.base_dir);
+                            }
+                        });
+                        ui.separator();
                         ui.checkbox(
                             &mut self.smart_vision_enabled,
                             "🎯 Використовувати Smart Vision",
@@ -1493,6 +1778,7 @@ impl AutoFlowApp {
     fn render_quick_start_bar(&mut self, ctx: &egui::Context) {
         let hk_start = self.hk_config.get("start_playback").to_uppercase();
         let hk_stop = self.hk_config.get("stop_playback").to_uppercase();
+        let hk_repeat = self.hk_config.get("repeat_last_action").to_uppercase();
         let is_running = self.player.is_running.load(Ordering::SeqCst);
 
         egui::TopBottomPanel::top("quick_start_bar")
@@ -1512,7 +1798,7 @@ impl AutoFlowApp {
                                         .strong(),
                                 )
                                 .fill(Color32::from_rgb(16, 185, 129))
-                                .min_size(Vec2::new(125.0, 28.0)),
+                                .min_size(Vec2::new(112.0, 26.0)),
                             )
                             .clicked()
                         {
@@ -1526,25 +1812,102 @@ impl AutoFlowApp {
                                     .strong(),
                             )
                             .fill(Color32::from_rgb(220, 38, 38))
-                            .min_size(Vec2::new(125.0, 28.0)),
+                            .min_size(Vec2::new(112.0, 26.0)),
                         )
                         .clicked()
                     {
                         self.stop_playback();
                     }
 
+                    if ui
+                        .button(format!("🔁 Повтор ({})", hk_repeat))
+                        .on_hover_text("Повторити останню виконану дію")
+                        .clicked()
+                    {
+                        self.repeat_last_action();
+                    }
+
+                    ui.separator();
+
+                    // Вбудована пам'ять сценаріїв у самій програмі
+                    ui.label(
+                        RichText::new("🗂️ Сценарій:")
+                            .color(Color32::from_rgb(167, 139, 250))
+                            .strong(),
+                    );
+                    let mut selected_preset = self.memory_store.active_index;
+                    let active_title = self
+                        .memory_store
+                        .presets
+                        .get(selected_preset)
+                        .map(|w| format!("{} ({} кр.)", w.name, w.actions.len()))
+                        .unwrap_or_else(|| "Сценарій".to_string());
+                    egui::ComboBox::from_id_salt("memory_preset_combo")
+                        .selected_text(active_title)
+                        .width(185.0)
+                        .show_ui(ui, |ui| {
+                            for (i, preset) in self.memory_store.presets.iter().enumerate() {
+                                let lbl = format!("{} ({} кр.)", preset.name, preset.actions.len());
+                                ui.selectable_value(&mut selected_preset, i, lbl);
+                            }
+                        });
+                    if selected_preset != self.memory_store.active_index {
+                        self.memory_store
+                            .sync_active(&self.workflow, &self.base_dir);
+                        self.memory_store.active_index = selected_preset;
+                        self.workflow = self
+                            .memory_store
+                            .presets
+                            .get(selected_preset)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.selected_row = None;
+                        self.autosave_workflow();
+                        self.progress_text = format!(
+                            "🗂️ Перемкнуто на сценарій з пам'яті: «{}» ({} кроків)",
+                            self.workflow.name,
+                            self.workflow.actions.len()
+                        );
+                    }
+
+                    if ui
+                        .small_button("➕")
+                        .on_hover_text("Зберегти як новий сценарій у пам'ять програми")
+                        .clicked()
+                    {
+                        self.active_modal = ActiveModal::SaveMemoryPresetDialog {
+                            name_input: format!(
+                                "Сценарій {}",
+                                self.memory_store.presets.len() + 1
+                            ),
+                            create_empty: false,
+                        };
+                    }
+                    if self.memory_store.presets.len() > 1
+                        && ui
+                            .small_button("🗑️")
+                            .on_hover_text("Видалити поточний сценарій з пам'яті програми")
+                            .clicked()
+                    {
+                        let deleted_name = self.workflow.name.clone();
+                        self.workflow = self.memory_store.delete_active(&self.base_dir);
+                        self.selected_row = None;
+                        self.autosave_workflow();
+                        self.progress_text =
+                            format!("🗑️ Видалено «{}» з пам'яті програми", deleted_name);
+                    }
+
                     ui.separator();
                     ui.label("Листів:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.cycles_str)
-                            .desired_width(44.0),
+                            .desired_width(36.0),
                     );
 
-                    ui.add_space(6.0);
                     ui.label("Швидкість:");
                     egui::ComboBox::from_id_salt("speed_combo")
                         .selected_text(SPEED_LABELS[self.speed_index].0)
-                        .width(135.0)
+                        .width(120.0)
                         .show_ui(ui, |ui| {
                             for (i, &(lbl, _)) in SPEED_LABELS.iter().enumerate() {
                                 ui.selectable_value(&mut self.speed_index, i, lbl);
@@ -1554,12 +1917,31 @@ impl AutoFlowApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.checkbox(
                             &mut self.smart_vision_enabled,
-                            RichText::new("🎯 Smart Vision")
+                            RichText::new("🎯 Vision")
                                 .color(Color32::from_rgb(56, 189, 248))
                                 .strong(),
                         );
-                        ui.add_space(8.0);
-                        ui.checkbox(&mut self.pause_between_cycles, "⏸ Пауза циклу");
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut self.pause_between_cycles, "⏸ Цикл");
+                        ui.add_space(4.0);
+                        if ui
+                            .add(
+                                egui::DragValue::new(
+                                    &mut self.memory_store.overlay_transparency_pct,
+                                )
+                                .range(5..=85)
+                                .suffix("%"),
+                            )
+                            .on_hover_text("Прозорість плаваючого вікна поверх усіх вікон (5%..85%)")
+                            .changed()
+                        {
+                            self.memory_store.save(&self.base_dir);
+                        }
+                        ui.label(
+                            RichText::new("Прозорість:")
+                                .color(Color32::from_rgb(251, 191, 36))
+                                .small(),
+                        );
                     });
                 });
             });
@@ -2882,6 +3264,79 @@ impl AutoFlowApp {
                 if let Some((ax, ay, show_m)) = confirm_seq {
                     self.workflow.add_start_sequence(ax, ay, show_m);
                     self.autosave_workflow();
+                }
+            }
+            ActiveModal::SaveMemoryPresetDialog {
+                name_input,
+                create_empty,
+            } => {
+                let mut save_preset_cmd: Option<(String, bool)> = None;
+                egui::Window::new("🗂️ Збереження сценарію в пам'ять програми")
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(380.0)
+                    .show(ctx, |ui| {
+                        ui.label("Назва сценарію у внутрішній пам'яті:");
+                        ui.text_edit_singleline(name_input);
+                        ui.add_space(4.0);
+                        ui.radio_value(
+                            create_empty,
+                            false,
+                            format!(
+                                "Зберегти копію поточного сценарію ({} кроків)",
+                                self.workflow.actions.len()
+                            ),
+                        );
+                        ui.radio_value(
+                            create_empty,
+                            true,
+                            "Створити новий порожній сценарій (0 кроків)",
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Скасувати").clicked() {
+                                close_modal = true;
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("💾 Зберегти в пам'ять")
+                                            .color(Color32::WHITE)
+                                            .strong(),
+                                    )
+                                    .fill(Color32::from_rgb(16, 185, 129)),
+                                )
+                                .clicked()
+                            {
+                                save_preset_cmd = Some((name_input.clone(), *create_empty));
+                                close_modal = true;
+                            }
+                        });
+                    });
+
+                if let Some((title, empty)) = save_preset_cmd {
+                    let clean_title = if title.trim().is_empty() {
+                        format!("Сценарій {}", self.memory_store.presets.len() + 1)
+                    } else {
+                        title.trim().to_string()
+                    };
+                    self.memory_store
+                        .sync_active(&self.workflow, &self.base_dir);
+                    let mut new_wf = if empty {
+                        Workflow::default()
+                    } else {
+                        self.workflow.clone()
+                    };
+                    new_wf.name = clean_title.clone();
+                    self.memory_store
+                        .save_as_new(new_wf.clone(), &clean_title, &self.base_dir);
+                    self.workflow = new_wf;
+                    self.selected_row = None;
+                    self.autosave_workflow();
+                    self.progress_text = format!(
+                        "💾 Сценарій «{}» збережено у вбудовану пам'ять програми!",
+                        clean_title
+                    );
                 }
             }
         }

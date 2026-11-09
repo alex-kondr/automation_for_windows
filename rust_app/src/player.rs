@@ -59,6 +59,8 @@ pub struct PlayerSyncState {
     pub checkpoint_cvar: Condvar,
     pub file_menu_response: Mutex<Option<Option<DetectedFile>>>,
     pub file_menu_cvar: Condvar,
+    pub jump_to_step_idx: Mutex<Option<usize>>,
+    pub last_executed_step_idx: Mutex<Option<usize>>,
 }
 
 impl Default for PlayerSyncState {
@@ -68,6 +70,8 @@ impl Default for PlayerSyncState {
             checkpoint_cvar: Condvar::new(),
             file_menu_response: Mutex::new(None),
             file_menu_cvar: Condvar::new(),
+            jump_to_step_idx: Mutex::new(None),
+            last_executed_step_idx: Mutex::new(None),
         }
     }
 }
@@ -107,6 +111,18 @@ impl ActionPlayer {
     pub fn resume_from_file_menu(&self, selected: Option<DetectedFile>) {
         *self.sync.file_menu_response.lock() = Some(selected);
         self.sync.file_menu_cvar.notify_all();
+    }
+
+    /// Переходить до зазначеного кроку `target_idx` прямо під час виконання або з точки перевірки.
+    pub fn jump_to_step(&self, target_idx: usize) {
+        *self.sync.jump_to_step_idx.lock() = Some(target_idx);
+        *self.sync.checkpoint_response.lock() = Some("jump".to_string());
+        self.sync.checkpoint_cvar.notify_all();
+    }
+
+    /// Повертає індекс останньої фактично виконаної дії.
+    pub fn last_executed_step(&self) -> Option<usize> {
+        *self.sync.last_executed_step_idx.lock()
     }
 
     pub fn play(
@@ -177,10 +193,15 @@ impl ActionPlayer {
                 let total_steps = actions.len();
                 let eff_start = start_step.min(total_steps);
                 let eff_end = end_step.unwrap_or(total_steps).min(total_steps).max(eff_start);
+                *sync.jump_to_step_idx.lock() = None;
 
-                for idx in eff_start..eff_end {
+                let mut idx = eff_start;
+                while idx < eff_end {
                     if abort_req.load(Ordering::SeqCst) {
                         break 'cycle_loop;
+                    }
+                    if let Some(jump_target) = sync.jump_to_step_idx.lock().take() {
+                        idx = jump_target.min(total_steps.saturating_sub(1));
                     }
 
                     let action = &actions[idx];
@@ -204,18 +225,27 @@ impl ActionPlayer {
                             abort_req.store(true, Ordering::SeqCst);
                             break 'cycle_loop;
                         }
-                    } else if let Err(err) = execute_single_action(
-                        action,
-                        &workflow,
-                        speed,
-                        &abort_req,
-                        &sync,
-                        &ui_tx,
-                    ) {
-                        save_error_log_and_screenshot(&err, cycle, total_cycles, idx, action);
-                        success = false;
-                        finish_msg = format!("Помилка виконання на кроці {}: {}", idx + 1, err);
-                        break 'cycle_loop;
+                    } else {
+                        *sync.last_executed_step_idx.lock() = Some(idx);
+                        if let Err(err) = execute_single_action(
+                            action,
+                            &workflow,
+                            speed,
+                            &abort_req,
+                            &sync,
+                            &ui_tx,
+                        ) {
+                            save_error_log_and_screenshot(&err, cycle, total_cycles, idx, action);
+                            success = false;
+                            finish_msg = format!("Помилка виконання на кроці {}: {}", idx + 1, err);
+                            break 'cycle_loop;
+                        }
+                    }
+
+                    if let Some(jump_target) = sync.jump_to_step_idx.lock().take() {
+                        idx = jump_target.min(total_steps.saturating_sub(1));
+                    } else {
+                        idx += 1;
                     }
                 }
 

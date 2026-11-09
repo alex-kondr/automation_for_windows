@@ -11,6 +11,7 @@ mod ocr_and_gemini;
 mod player;
 mod recorder;
 mod simd_vision;
+mod status_overlay;
 mod tray;
 mod uia_manager;
 
