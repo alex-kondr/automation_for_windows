@@ -18,16 +18,133 @@ use windows::Win32::UI::Shell::{
     NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    FindWindowW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadIconW,
-    LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT,
-    GWL_EXSTYLE, HICON, HWND_BOTTOM, HWND_TOP, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE,
-    LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING, MSG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND, WM_DESTROY,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_EX_APPWINDOW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
+    AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    GetWindowRect, LoadIconW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
+    TranslateMessage, CW_USEDEFAULT, GWL_EXSTYLE, HICON, HWND_BOTTOM, HWND_TOP, IDI_APPLICATION,
+    IMAGE_ICON, LR_DEFAULTCOLOR, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING, MSG,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WS_OVERLAPPEDWINDOW,
 };
+
+const EMBEDDED_TRAY_ICO: &[u8] = include_bytes!("../assets/autoflow.ico");
+const EMBEDDED_TRAY_PNG: &[u8] = include_bytes!("../assets/autoflow_preview.png");
+
+/// Створює нативний `HICON` (32×32 BGRA) безпосередньо в пам'яті з вбудованих ресурсів програми,
+/// щоб значок у системному треї Windows завжди мав яскраву тематичну іконку незалежно від зовнішніх файлів.
+unsafe fn create_embedded_tray_hicon(ico_path: &PathBuf) -> HICON {
+    // 1. Найнадійніший спосіб: генеруємо стандартний 32x32 32-bit BGRA DIB буфер прямо з PNG у пам'яті
+    if let Ok(img) = image::load_from_memory(EMBEDDED_TRAY_PNG) {
+        let rgba = img
+            .resize_exact(32, 32, image::imageops::FilterType::Lanczos3)
+            .into_rgba8();
+        let sz: u32 = 32;
+        let and_stride: usize = 4; // ((32 + 31) / 32) * 4
+        let mut dib = Vec::with_capacity(40 + (sz * sz * 4) as usize + and_stride * (sz as usize));
+
+        // BITMAPINFOHEADER (40 байт)
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&(sz as i32).to_le_bytes()); // biWidth
+        dib.extend_from_slice(&((sz * 2) as i32).to_le_bytes()); // biHeight (XOR + AND)
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression (BI_RGB)
+        dib.extend_from_slice(&(sz * sz * 4).to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+
+        let mut and_mask = vec![0u8; and_stride * (sz as usize)];
+        for y_inv in 0..sz {
+            let y = sz - 1 - y_inv;
+            for x in 0..sz {
+                let p = rgba.get_pixel(x, y).0;
+                dib.push(p[2]); // B
+                dib.push(p[1]); // G
+                dib.push(p[0]); // R
+                dib.push(p[3]); // A
+                if p[3] < 16 {
+                    let byte_idx = (y_inv as usize) * and_stride + (x as usize / 8);
+                    and_mask[byte_idx] |= 1 << (7 - (x % 8));
+                }
+            }
+        }
+        dib.extend_from_slice(&and_mask);
+
+        if let Ok(hicon) =
+            CreateIconFromResourceEx(&dib, true, 0x00030000, 32, 32, LR_DEFAULTCOLOR)
+        {
+            if !hicon.is_invalid() {
+                return hicon;
+            }
+        }
+    }
+
+    // 2. Резервний спосіб: витягуємо 32x32 фрейм із вбудованого autoflow.ico
+    if EMBEDDED_TRAY_ICO.len() > 6 {
+        let count = u16::from_le_bytes([EMBEDDED_TRAY_ICO[4], EMBEDDED_TRAY_ICO[5]]) as usize;
+        for i in 0..count {
+            let entry_off = 6 + i * 16;
+            if entry_off + 16 <= EMBEDDED_TRAY_ICO.len() {
+                let w = EMBEDDED_TRAY_ICO[entry_off];
+                let size = u32::from_le_bytes([
+                    EMBEDDED_TRAY_ICO[entry_off + 8],
+                    EMBEDDED_TRAY_ICO[entry_off + 9],
+                    EMBEDDED_TRAY_ICO[entry_off + 10],
+                    EMBEDDED_TRAY_ICO[entry_off + 11],
+                ]) as usize;
+                let data_off = u32::from_le_bytes([
+                    EMBEDDED_TRAY_ICO[entry_off + 12],
+                    EMBEDDED_TRAY_ICO[entry_off + 13],
+                    EMBEDDED_TRAY_ICO[entry_off + 14],
+                    EMBEDDED_TRAY_ICO[entry_off + 15],
+                ]) as usize;
+                if (w == 32 || w == 16) && data_off + size <= EMBEDDED_TRAY_ICO.len() {
+                    let slice = &EMBEDDED_TRAY_ICO[data_off..data_off + size];
+                    if let Ok(hicon) = CreateIconFromResourceEx(
+                        slice,
+                        true,
+                        0x00030000,
+                        w as i32,
+                        w as i32,
+                        LR_DEFAULTCOLOR,
+                    ) {
+                        if !hicon.is_invalid() {
+                            return hicon;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Резервний спосіб: іконка з PE-ресурсів виконуваного файлу або зовнішнього .ico
+    let hinst = GetModuleHandleW(None).unwrap_or_default();
+    if let Ok(hicon) = LoadIconW(hinst, PCWSTR(1 as *const u16)) {
+        if !hicon.is_invalid() {
+            return hicon;
+        }
+    }
+    if ico_path.exists() {
+        let ico_h = HSTRING::from(ico_path.to_string_lossy().as_ref());
+        if let Ok(handle) = LoadImageW(
+            None,
+            &ico_h,
+            IMAGE_ICON,
+            32,
+            32,
+            LR_LOADFROMFILE | LR_DEFAULTCOLOR,
+        ) {
+            return HICON(handle.0);
+        }
+    }
+
+    LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
+}
 
 const WM_TRAYICON: u32 = WM_USER + 20;
 
@@ -223,10 +340,12 @@ impl WindowsTrayManager {
         thread::spawn(move || unsafe {
             let hinst = GetModuleHandleW(None).unwrap_or_default();
             let class_name = w!("AutoFlowNativeTrayWndClass");
+            let hicon = create_embedded_tray_hicon(&ico_path);
 
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(tray_wnd_proc),
                 hInstance: hinst.into(),
+                hIcon: hicon,
                 lpszClassName: class_name,
                 ..Default::default()
             };
@@ -251,23 +370,6 @@ impl WindowsTrayManager {
             };
 
             TRAY_STATE.lock().hwnd = hwnd.0 as isize;
-
-            let hicon: HICON = if ico_path.exists() {
-                let ico_h = HSTRING::from(ico_path.to_string_lossy().as_ref());
-                match LoadImageW(
-                    None,
-                    &ico_h,
-                    IMAGE_ICON,
-                    0,
-                    0,
-                    LR_LOADFROMFILE | LR_DEFAULTSIZE,
-                ) {
-                    Ok(handle) => HICON(handle.0),
-                    Err(_) => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
-                }
-            } else {
-                LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
-            };
 
             let mut nid = NOTIFYICONDATAW::default();
             nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;

@@ -55,6 +55,7 @@ pub enum OverlayClickEvent {
     CheckpointContinue,
     CheckpointSkip,
     StopPlayback,
+    JumpToPreviousCheckpoint,
     JumpToStep(usize),
     BoundsChanged(i32, i32, i32, i32),
 }
@@ -297,13 +298,25 @@ fn rebuild_buttons(st: &mut OverlayInternalState) {
             });
             x -= 3;
 
-            // Повернутись до ▾
-            let back_w = 104;
-            x -= back_w;
+            // Стрілка вибору конкретного кроку ▾
+            let menu_w = 18;
+            x -= menu_w;
             st.buttons.push(OverlayButton {
                 id: 15,
+                rect: (x, btn_y1, x + menu_w, btn_y2),
+                label: "▾".to_string(),
+                bg_rgb: (30, 58, 138),
+                text_rgb: (147, 197, 253),
+            });
+            x -= 2;
+
+            // Попередня дія (повернення до попереднього «Очікування підтвердження»)
+            let back_w = 98;
+            x -= back_w;
+            st.buttons.push(OverlayButton {
+                id: 14,
                 rect: (x, btn_y1, x + back_w, btn_y2),
-                label: "⏪ Повернутись ▾".to_string(),
+                label: "⏪ Попередня дія".to_string(),
                 bg_rgb: (30, 58, 138),
                 text_rgb: (147, 197, 253),
             });
@@ -321,15 +334,27 @@ fn rebuild_buttons(st: &mut OverlayInternalState) {
                 bg_rgb: (220, 38, 38),
                 text_rgb: (255, 255, 255),
             });
-            x -= 4;
+            x -= 3;
 
-            // Повернутись до ▾
-            let back_w = 108;
-            x -= back_w;
+            // Стрілка вибору конкретного кроку ▾
+            let menu_w = 18;
+            x -= menu_w;
             st.buttons.push(OverlayButton {
                 id: 15,
+                rect: (x, btn_y1, x + menu_w, btn_y2),
+                label: "▾".to_string(),
+                bg_rgb: (30, 58, 138),
+                text_rgb: (147, 197, 253),
+            });
+            x -= 2;
+
+            // Попередня дія (повернення до попереднього «Очікування підтвердження»)
+            let back_w = 102;
+            x -= back_w;
+            st.buttons.push(OverlayButton {
+                id: 14,
                 rect: (x, btn_y1, x + back_w, btn_y2),
-                label: "⏪ Повернутись ▾".to_string(),
+                label: "⏪ Попередня дія".to_string(),
                 bg_rgb: (30, 58, 138),
                 text_rgb: (147, 197, 253),
             });
@@ -620,6 +645,7 @@ unsafe extern "system" fn overlay_wnd_proc(
                         10 => Some(OverlayClickEvent::CheckpointContinue),
                         11 => Some(OverlayClickEvent::CheckpointSkip),
                         12 | 20 => Some(OverlayClickEvent::StopPlayback),
+                        14 => Some(OverlayClickEvent::JumpToPreviousCheckpoint),
                         _ => None,
                     };
                     if let Some(ev) = ev_opt {

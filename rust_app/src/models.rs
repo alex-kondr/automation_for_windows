@@ -402,6 +402,21 @@ impl Workflow {
         combined.extend(self.actions.drain(..));
         self.actions = combined;
     }
+
+    /// Знаходить індекс попереднього кроку «Очікування підтвердження» (`checkpoint`) перед `from_idx`.
+    /// Якщо попередньої точки підтвердження немає, повертає `0` (початок сценарію).
+    pub fn find_previous_checkpoint_idx(&self, from_idx: usize) -> usize {
+        if self.actions.is_empty() {
+            return 0;
+        }
+        let limit = from_idx.min(self.actions.len().saturating_sub(1));
+        for i in (0..limit).rev() {
+            if self.actions[i].action_type == "checkpoint" {
+                return i;
+            }
+        }
+        0
+    }
 }
 
 /// Опис усіх гарячих клавіш програми.
@@ -412,7 +427,7 @@ pub const HOTKEY_DEFINITIONS: &[(&str, &str, &str)] = &[
     ("checkpoint", "⏸ Точка перевірки (додати при записі / продовжити при виконанні)", "f8"),
     ("pause_recording", "⏯ Пауза / Продовжити запис дій", "f9"),
     ("stop_recording", "⏹ Завершити запис дій", "f10"),
-    ("repeat_last_action", "🔁 Повторити останню виконану дію", "f11"),
+    ("repeat_last_action", "⏪ Попередня дія (повернутись до попереднього 'Очікування підтвердження')", "f11"),
     ("toggle_tray", "📥 Згорнути в трей / Розгорнути вікно", "f12"),
 ];
 

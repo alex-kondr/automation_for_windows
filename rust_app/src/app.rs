@@ -525,31 +525,39 @@ impl AutoFlowApp {
         }
     }
 
-    /// Повторює останню виконану дію (або поточний/обраний крок), як під час активного виконання, так і в режимі очікування.
+    /// Повертає виконання сценарію до попереднього кроку «Очікування підтвердження» (`checkpoint`).
     pub fn repeat_last_action(&mut self) {
         if self.workflow.actions.is_empty() || self.recorder.is_recording {
             return;
         }
-        let target_idx = self
-            .player
-            .last_executed_step()
-            .or_else(|| {
-                self.active_checkpoint
-                    .as_ref()
-                    .map(|cp| cp.step_idx.saturating_sub(1))
-            })
+        let cur_idx = self
+            .active_checkpoint
+            .as_ref()
+            .map(|cp| cp.step_idx)
             .or(self.running_row)
+            .or_else(|| self.player.last_executed_step())
             .or(self.selected_row)
-            .unwrap_or(0)
+            .unwrap_or_else(|| self.workflow.actions.len().saturating_sub(1))
             .min(self.workflow.actions.len() - 1);
+
+        let target_idx = self.workflow.find_previous_checkpoint_idx(cur_idx);
 
         if self.player.is_running.load(Ordering::SeqCst) {
             self.active_checkpoint = None;
             self.player.jump_to_step(target_idx);
-            self.progress_text = format!("🔁 Повтор дії №{}...", target_idx + 1);
+            self.running_row = Some(target_idx);
+            self.selected_row = Some(target_idx);
+            self.progress_text = format!(
+                "⏪ Повернення до попереднього 'Очікування підтвердження' (крок №{})...",
+                target_idx + 1
+            );
         } else {
             self.selected_row = Some(target_idx);
-            self.start_playback_range(target_idx, Some(target_idx + 1), Some(1));
+            self.start_playback_range(target_idx, None, None);
+            self.progress_text = format!(
+                "⏪ Запуск з попереднього 'Очікування підтвердження' (крок №{})...",
+                target_idx + 1
+            );
         }
     }
 
@@ -881,6 +889,9 @@ impl AutoFlowApp {
                     } else {
                         self.stop_playback();
                     }
+                }
+                OverlayClickEvent::JumpToPreviousCheckpoint => {
+                    self.repeat_last_action();
                 }
                 OverlayClickEvent::JumpToStep(target_idx) => {
                     self.active_checkpoint = None;
@@ -1521,7 +1532,7 @@ impl AutoFlowApp {
                         }
                         if ui
                             .button(format!(
-                                "🔁 Повторити останню дію ({})",
+                                "⏪ Попередня дія — до попереднього підтвердження ({})",
                                 hk_repeat
                             ))
                             .clicked()
@@ -1820,8 +1831,8 @@ impl AutoFlowApp {
                     }
 
                     if ui
-                        .button(format!("🔁 Повтор ({})", hk_repeat))
-                        .on_hover_text("Повторити останню виконану дію")
+                        .button(format!("⏪ Попередня дія ({})", hk_repeat))
+                        .on_hover_text("Повернутись до попереднього 'Очікування підтвердження'")
                         .clicked()
                     {
                         self.repeat_last_action();
@@ -2617,6 +2628,7 @@ impl AutoFlowApp {
 
         let hk_cp = self.hk_config.get("checkpoint").to_uppercase();
         let hk_stop = self.hk_config.get("stop_playback").to_uppercase();
+        let hk_repeat = self.hk_config.get("repeat_last_action").to_uppercase();
         let title = cp
             .action
             .title
@@ -2638,6 +2650,7 @@ impl AutoFlowApp {
         );
 
         let mut user_decision: Option<&str> = None;
+        let mut jump_prev_checkpoint = false;
 
         egui::Window::new("⏸️ Точка перевірки")
             .collapsible(false)
@@ -2666,6 +2679,20 @@ impl AutoFlowApp {
                     {
                         user_decision = Some("continue");
                     }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("⏪ Попередня дія ({})", hk_repeat))
+                                    .color(Color32::from_rgb(147, 197, 253))
+                                    .strong(),
+                            )
+                            .fill(Color32::from_rgb(30, 58, 138)),
+                        )
+                        .on_hover_text("Повернутись до попереднього 'Очікування підтвердження'")
+                        .clicked()
+                    {
+                        jump_prev_checkpoint = true;
+                    }
                     if ui.button("⏩ Пропустити").clicked() {
                         user_decision = Some("skip");
                     }
@@ -2685,7 +2712,9 @@ impl AutoFlowApp {
                 });
             });
 
-        if let Some(dec) = user_decision {
+        if jump_prev_checkpoint {
+            self.repeat_last_action();
+        } else if let Some(dec) = user_decision {
             self.active_checkpoint = None;
             self.player.resume_from_checkpoint(dec);
         }

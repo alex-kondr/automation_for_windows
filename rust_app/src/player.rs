@@ -438,7 +438,7 @@ fn execute_single_action(
     let delay = ((action.delay_before.max(0.05)) / speed_factor).clamp(0.03, 15.0);
     let mut elapsed = 0.0;
     while elapsed < delay {
-        if abort_req.load(Ordering::SeqCst) {
+        if abort_req.load(Ordering::SeqCst) || sync.jump_to_step_idx.lock().is_some() {
             return Ok(());
         }
         let chunk = (delay - elapsed).min(0.04);
@@ -446,7 +446,7 @@ fn execute_single_action(
         elapsed += chunk;
     }
 
-    if abort_req.load(Ordering::SeqCst) {
+    if abort_req.load(Ordering::SeqCst) || sync.jump_to_step_idx.lock().is_some() {
         return Ok(());
     }
 
@@ -619,7 +619,7 @@ fn execute_single_action(
         )));
 
         for i in 0..count {
-            if abort_req.load(Ordering::SeqCst) {
+            if abort_req.load(Ordering::SeqCst) || sync.jump_to_step_idx.lock().is_some() {
                 break;
             }
             type_key_combo(key_str);
